@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ASCII Cam</title>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_detection@0.4/face_detection.js" crossorigin="anonymous"></script>
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; background: #000; overflow: hidden; cursor: none; }
+    #cam, #ascii {
+      position: absolute;
+      top: 0; left: 0;
+      height: 100%;
+    }
+    #cam  { object-fit: cover; }
+    #ascii { display: block; }
+    #scratch { display: none; }
+  </style>
+</head>
+<body>
+  <video id="cam" autoplay muted playsinline></video>
+  <canvas id="ascii"></canvas>
+  <canvas id="scratch"></canvas>
+
+  <script>
+    // ── Character ramp: space (dark) → $ (bright) ─────────────────────────────
+    const CHARS = " .'`^\",:;Il!i><~+_-?][}{1)(|\\/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$";
+
+    // ── Themes ────────────────────────────────────────────────────────────────
+    const THEMES = [
+      { bg: '#000000', fg: '#00ff41',  mode: 'solid'   }, // Matrix
+      { bg: '#000000', fg: '#ffb000',  mode: 'solid'   }, // Amber
+      { bg: '#000000', fg: '#e8e8e8',  mode: 'solid'   }, // Terminal
+      { bg: '#f0f0f0', fg: '#000000',  mode: 'solid'   }, // Inverted
+      { bg: '#0a0000', fg: '#ff3300',  mode: 'solid'   }, // Doom
+      { bg: '#0d0025', fg: '#00ffff',  mode: 'solid'   }, // Cyberpunk
+      { bg: '#1a0035', fg: '#f72585',  mode: 'solid'   }, // Synthwave
+      { bg: '#060d30', fg: '#ff71ce',  mode: 'solid'   }, // Vaporwave
+      { bg: '#001100', fg: '#39ff14',  mode: 'solid'   }, // Neon
+      { bg: '#001f3f', fg: '#7ec8e3',  mode: 'solid'   }, // Blueprint
+      { bg: '#110800', fg: '#ffd700',  mode: 'solid'   }, // Gold
+      { bg: '#0a0010', fg: '#bf5fff',  mode: 'solid'   }, // Ultraviolet
+      { bg: '#001020', fg: '#a8d8ff',  mode: 'solid'   }, // Ice
+      { bg: '#000000', fg: null,       mode: 'color'   }, // Full Color
+      { bg: '#000000', fg: null,       mode: 'rainbow' }, // Rainbow
+      { bg: '#000000', fg: null,       mode: 'heat'    }, // Heat
+      { bg: '#000000', fg: null,       mode: 'glitch'  }, // Glitch
+    ];
+
+    // ── State ─────────────────────────────────────────────────────────────────
+    let splitPct     = 0.5;   // left panel fraction of viewport
+    let tIdx         = 0;
+    let currentCellH = 13;    // smoothly interpolated cell height
+    let targetCellH  = 13;    // driven by face detection
+    let frameCount   = 0;
+    let fdInFlight   = false;
+    let dragging     = false;
+
+    // ── Elements ──────────────────────────────────────────────────────────────
+    const cam     = document.getElementById('cam');
+    const ascii   = document.getElementById('ascii');
+    const scratch = document.getElementById('scratch');
+    const ctx     = ascii.getContext('2d', { alpha: false });
+    const sctx    = scratch.getContext('2d', { willReadFrequently: true });
+
+    // ── Layout: position + size both panels from splitPct ─────────────────────
+    function applyLayout() {
+      const leftW  = Math.round(window.innerWidth * splitPct);
+      const rightW = window.innerWidth - leftW;
+      cam.style.width    = leftW + 'px';
+      ascii.style.left   = leftW + 'px';
+      ascii.style.width  = rightW + 'px';
+      ascii.width        = rightW;
+      ascii.height       = window.innerHeight;
+    }
+    applyLayout();
+    window.addEventListener('resize', applyLayout);
+
+    // ── Invisible drag handle ─────────────────────────────────────────────────
+    const DRAG_ZONE = 10; // px either side of the seam
+
+    document.addEventListener('mousemove', e => {
+      const seam = window.innerWidth * splitPct;
+      if (dragging) {
+        splitPct = Math.min(0.85, Math.max(0.15, e.clientX / window.innerWidth));
+        applyLayout();
+        document.body.style.cursor = 'col-resize';
+      } else {
+        document.body.style.cursor = Math.abs(e.clientX - seam) < DRAG_ZONE ? 'col-resize' : 'none';
+      }
+    });
+    document.addEventListener('mousedown', e => {
+      if (Math.abs(e.clientX - window.innerWidth * splitPct) < DRAG_ZONE) {
+        dragging = true;
+        e.preventDefault();
+      }
+    });
+    document.addEventListener('mouseup', () => { dragging = false; });
+
+    // ── Keys: < > to cycle themes ─────────────────────────────────────────────
+    document.addEventListener('keydown', e => {
+      if (e.key === ',' || e.key === '<') tIdx = (tIdx - 1 + THEMES.length) % THEMES.length;
+      if (e.key === '.' || e.key === '>') tIdx = (tIdx + 1) % THEMES.length;
+    });
+
+    // ── MediaPipe face detection ───────────────────────────────────────────────
+    // boundingBox.width is 0..1 (fraction of frame width)
+    // closer face → larger bbox → bigger cell height → bigger ASCII chars
+    const fd = new FaceDetection({
+      locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/face_detection@0.4/${f}`
+    });
+    fd.setOptions({ model: 'short', minDetectionConfidence: 0.5 });
+    fd.onResults(results => {
+      fdInFlight = false;
+      if (results.detections && results.detections.length > 0) {
+        const bw = results.detections[0].boundingBox.width; // 0..1
+        // 0.05 (far)  → cellH  4
+        // 0.65 (close) → cellH 28
+        targetCellH = 4 + Math.min(bw / 0.65, 1) * 24;
+      } else {
+        // No face: ease back to default
+        targetCellH += (13 - targetCellH) * 0.05;
+      }
+    });
+
+    // ── Camera ────────────────────────────────────────────────────────────────
+    navigator.mediaDevices
+      .getUserMedia({ video: { facingMode: 'environment' }, audio: false })
+      .catch(() => navigator.mediaDevices.getUserMedia({ video: true, audio: false }))
+      .then(stream => { cam.srcObject = stream; requestAnimationFrame(loop); });
+
+    // ── Render loop ───────────────────────────────────────────────────────────
+    function loop() {
+      requestAnimationFrame(loop);
+      if (cam.readyState < 2) return;
+      frameCount++;
+
+      // Feed face detector every 5 frames (≈12 fps at 60 fps)
+      if (frameCount % 5 === 0 && !fdInFlight) {
+        fdInFlight = true;
+        fd.send({ image: cam }).catch(() => { fdInFlight = false; });
+      }
+
+      // Smooth cell height
+      currentCellH += (targetCellH - currentCellH) * 0.08;
+      const cellH = Math.max(4, Math.round(currentCellH));
+
+      const theme = THEMES[tIdx];
+      const W = ascii.width;
+      const H = ascii.height;
+
+      ctx.font = `${cellH}px monospace`;
+      const cellW = ctx.measureText('M').width;
+
+      const cols = Math.floor(W / cellW);
+      const rows = Math.floor(H / cellH);
+      if (cols < 1 || rows < 1) return;
+
+      if (scratch.width !== cols || scratch.height !== rows) {
+        scratch.width  = cols;
+        scratch.height = rows;
+      }
+
+      sctx.drawImage(cam, 0, 0, cols, rows);
+      const px = sctx.getImageData(0, 0, cols, rows).data;
+
+      ctx.fillStyle = theme.bg;
+      ctx.fillRect(0, 0, W, H);
+      ctx.font         = `${cellH}px monospace`;
+      ctx.textBaseline = 'top';
+
+      for (let row = 0; row < rows; row++) {
+        for (let col = 0; col < cols; col++) {
+          const i  = (row * cols + col) * 4;
+          const r  = px[i], g = px[i + 1], b = px[i + 2];
+          const br = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+          const char = CHARS[Math.round(br * (CHARS.length - 1))];
+          if (char === ' ') continue;
+
+          let color;
+          switch (theme.mode) {
+            case 'solid': color = theme.fg; break;
+
+            case 'color': color = `rgb(${r},${g},${b})`; break;
+
+            case 'rainbow': {
+              const h = (col / cols * 360 + row / rows * 120 + frameCount * 0.8) % 360;
+              color = `hsl(${h},100%,${30 + br * 45}%)`;
+              break;
+            }
+
+            case 'heat': {
+              let hr, hg, hb;
+              if      (br < 0.33) { hr = Math.round(br / 0.33 * 255); hg = 0;   hb = 0; }
+              else if (br < 0.66) { const s = (br - 0.33) / 0.33; hr = 255; hg = Math.round(s * 165);        hb = 0; }
+              else                { const s = (br - 0.66) / 0.34; hr = 255; hg = Math.round(165 + s * 90);   hb = Math.round(s * 255); }
+              color = `rgb(${hr},${hg},${hb})`;
+              break;
+            }
+
+            case 'glitch': {
+              const glitched = Math.sin(row * 0.3 + frameCount * 0.07) > 0.85;
+              if (glitched) {
+                const gr = px[((row * cols + Math.min(col + 2, cols - 1)) * 4)];
+                const gb = px[((row * cols + Math.max(col - 2, 0)) * 4) + 2];
+                color = `rgb(${gr},${g},${gb})`;
+              } else {
+                color = `rgb(${r},${g},${b})`;
+              }
+              break;
+            }
+          }
+
+          ctx.fillStyle = color;
+          ctx.fillText(char, col * cellW, row * cellH);
+        }
+      }
+    }
+  </script>
+</body>
+</html>
